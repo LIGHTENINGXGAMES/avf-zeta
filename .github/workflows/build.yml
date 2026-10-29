@@ -34,21 +34,22 @@ jobs:
               uint64_t address, size;
               uint32_t kind, shift, width, reserved;
           };
-          static volatile uint8_t *avf_uart;
+          static void register_serial_functions(struct pe_serial_functions *fns);
+          static uintptr_t avf_uart;
           static uint32_t avf_uart_kind, avf_uart_shift, avf_uart_width;
           
           static uint32_t avf_uart_read(unsigned reg)
           {
               if (avf_uart_width == 4)
                   return *(volatile uint32_t *)(avf_uart + (reg << avf_uart_shift));
-              return avf_uart[reg << avf_uart_shift];
+              return *(volatile uint8_t *)(avf_uart + (reg << avf_uart_shift));
           }
           static void avf_uart_write(unsigned reg, uint32_t value)
           {
               if (avf_uart_width == 4)
                   *(volatile uint32_t *)(avf_uart + (reg << avf_uart_shift)) = value;
               else
-                  avf_uart[reg << avf_uart_shift] = (uint8_t)value;
+                  *(volatile uint8_t *)(avf_uart + (reg << avf_uart_shift)) = (uint8_t)value;
           }
           static void avf_uart_noop(void) { }
           static unsigned avf_uart_tx_ready(void)
@@ -82,10 +83,11 @@ jobs:
               if (size != sizeof(*config) || config->reserved ||
                   (config->kind != 1 && config->kind != 2) || config->shift > 2 ||
                   (config->width != 1 && config->width != 4) ||
+                  (config->width == 4 && ((config->address & 3) || (config->kind == 1 && config->shift < 2))) ||
                   config->size < (config->kind == 1 ? (8U << config->shift) : 0x1000U) ||
                   config->size > 0x10000 || config->address + config->size < config->address)
                   panic("AVF: invalid console resource");
-              avf_uart = (volatile uint8_t *)ml_io_map(config->address, config->size);
+              avf_uart = ml_io_map(config->address, config->size);
               avf_uart_kind = config->kind;
               avf_uart_shift = config->shift;
               avf_uart_width = config->width;
@@ -132,6 +134,13 @@ jobs:
         run: |
           cd upstream
           ./unixnu build kernel
+      - name: Show compiler errors
+        if: failure()
+        run: |
+          for log in upstream/out/zeta/logs/*.log; do
+            [ -f "$log" ] || continue
+            grep -n -B3 -A8 -E '(fatal )?error:|Undefined symbols|^ld:' "$log" | head -200 || true
+          done
       - name: Retain kernel and build logs
         if: always()
         uses: actions/upload-artifact@v4
