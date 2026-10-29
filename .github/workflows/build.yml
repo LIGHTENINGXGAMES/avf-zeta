@@ -1,0 +1,144 @@
+name: Build AVF Zeta kernel
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: avf-zeta-kernel
+  cancel-in-progress: false
+jobs:
+  kernel:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcodebuild -version
+      - name: Fetch pinned upstream sources
+        run: |
+          git clone https://github.com/none24smu/UniXNU.git upstream
+          git -C upstream checkout 68c513467bb6c44106c053c410582c1d14f96dd7
+          git clone https://github.com/none24smu/UniXNU-zeta.git device
+          git -C device checkout eb489285a1d9153872f00c93ebb519a269b249b5
+      - name: Integrate AVF console build patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          patch = Path('upstream') / 'patches/xnu-12377/native-dwc3-console.patch'
+          include = r'''/* SPDX-License-Identifier: BSD-2-Clause
+           * Included after pe_serial_functions and gPESF in XNU's pe_serial.c.
+           * Resources come from the crosvm FDT through the boot shim, never host SoC MMIO.
+           */
+          struct avf_uart_config {
+              uint64_t address, size;
+              uint32_t kind, shift, width, reserved;
+          };
+          static volatile uint8_t *avf_uart;
+          static uint32_t avf_uart_kind, avf_uart_shift, avf_uart_width;
+          
+          static uint32_t avf_uart_read(unsigned reg)
+          {
+              if (avf_uart_width == 4)
+                  return *(volatile uint32_t *)(avf_uart + (reg << avf_uart_shift));
+              return avf_uart[reg << avf_uart_shift];
+          }
+          static void avf_uart_write(unsigned reg, uint32_t value)
+          {
+              if (avf_uart_width == 4)
+                  *(volatile uint32_t *)(avf_uart + (reg << avf_uart_shift)) = value;
+              else
+                  avf_uart[reg << avf_uart_shift] = (uint8_t)value;
+          }
+          static void avf_uart_noop(void) { }
+          static unsigned avf_uart_tx_ready(void)
+          {
+              return avf_uart_kind == 1 ? (avf_uart_read(5) & 0x20) != 0
+                                       : (avf_uart_read(0x18) & 0x20) == 0;
+          }
+          static void avf_uart_tx(uint8_t byte) { avf_uart_write(0, byte); }
+          static unsigned avf_uart_rx_ready(void)
+          {
+              return avf_uart_kind == 1 ? (avf_uart_read(5) & 1) != 0
+                                       : (avf_uart_read(0x18) & 0x10) == 0;
+          }
+          static uint8_t avf_uart_rx(void) { return (uint8_t)avf_uart_read(0); }
+          static struct pe_serial_functions avf_uart_functions = {
+              .init = avf_uart_noop,
+              .transmit_ready = avf_uart_tx_ready,
+              .transmit_data = avf_uart_tx,
+              .receive_ready = avf_uart_rx_ready,
+              .receive_data = avf_uart_rx,
+              .device = SERIAL_UNKNOWN,
+          };
+          static bool avf_console_init(void)
+          {
+              const DeviceTreeNode *chosen;
+              const struct avf_uart_config *config;
+              unsigned size;
+              if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+                  SecureDTGetProperty(chosen, "avf,uart", (const void **)&config, &size) != kSuccess)
+                  return false;
+              if (size != sizeof(*config) || config->reserved ||
+                  (config->kind != 1 && config->kind != 2) || config->shift > 2 ||
+                  (config->width != 1 && config->width != 4) ||
+                  config->size < (config->kind == 1 ? (8U << config->shift) : 0x1000U) ||
+                  config->size > 0x10000 || config->address + config->size < config->address)
+                  panic("AVF: invalid console resource");
+              avf_uart = (volatile uint8_t *)ml_io_map(config->address, config->size);
+              avf_uart_kind = config->kind;
+              avf_uart_shift = config->shift;
+              avf_uart_width = config->width;
+              register_serial_functions(&avf_uart_functions);
+              return true;
+          }'''
+          lines = include.splitlines()
+          insert = '\n'.join('+' + s for s in [''] + lines)
+          source = patch.read_text()
+          first = '@@ -83,6 +83,24 @@'
+          second = '@@ -899,6 +917,14 @@'
+          anchor = '+#if XNU_NATIVE_DWC3_CONSOLE\n+extern bool unixnu_dwc3_init(void);'
+          hook = '+#if XNU_NATIVE_DWC3_CONSOLE\n+\tif (unixnu_dwc3_init()) {'
+          for expected in (first, second, anchor, hook):
+              if source.count(expected) != 1:
+                  raise SystemExit('pinned console integration context changed: ' + expected)
+          extra = len(lines) + 1
+          source = source.replace(first, f'@@ -83,6 +83,{24+extra} @@')
+          source = source.replace(second, f'@@ -899,6 +{917+extra},19 @@')
+          source = source.replace(anchor, insert + '\n' + anchor)
+          source = source.replace(hook, '+\tif (avf_console_init()) {\n'
+                                  '+\t\tuart_initted = true;\n+\t\treturn 1;\n+\t}\n+\n' + hook)
+          patch.write_text(source)
+          config = Path('device') / 'configs/avf_defconfig'
+          config.write_text('''CONFIG_XNU_BUILD_SCRIPT="build-xnu-12377.sh"
+          CONFIG_XNU_NATIVE_ARCH_TIMER=y
+          CONFIG_XNU_VIRTUAL_TIMER_ONLY=y
+          CONFIG_XNU_SOURCE_CORECRYPTO14=y
+          CONFIG_XNU_SOURCE_PTHREAD=y
+          CONFIG_XNU_ARM_DT_PLATFORM=y
+          CONFIG_XNU_ARMCPU=y
+          CONFIG_XNU_NATIVE_PAN=y
+          CONFIG_XNU_DT_PANIC_REGION=y
+          CONFIG_XNU_NATIVE_DWC3_CONSOLE=n
+          CONFIG_XNU_NATIVE_UFS_SM8350=n
+          CONFIG_XNU_TRUST_CACHE_RUNTIME=n
+          ''')
+          print('Prepared AVF console, one CPU, GICv3 and virtual timer; physical UFS/USB excluded.')
+          PY
+          cd upstream
+          ./unixnu defconfig avf_defconfig -D ../device
+          ./unixnu fetch
+      - name: Build source XNU 12377 for AVF
+        run: |
+          cd upstream
+          ./unixnu build kernel
+      - name: Retain kernel and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: avf-zeta-kernel
+          path: |
+            upstream/out/zeta/kernel/*
+            upstream/out/zeta/logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
